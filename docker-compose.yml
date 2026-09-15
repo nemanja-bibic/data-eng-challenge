@@ -9,6 +9,27 @@ x-app-env: &app-env
   POSTGRES_USER: postgres
   POSTGRES_PASSWORD: secret
 
+# --- PeerDB shared config ------------------------------------------------
+x-peerdb-catalog-env: &peerdb-catalog-env
+  PEERDB_CATALOG_HOST: peerdb-catalog
+  PEERDB_CATALOG_PORT: 5432
+  PEERDB_CATALOG_USER: postgres
+  PEERDB_CATALOG_PASSWORD: peerdb
+  PEERDB_CATALOG_DATABASE: postgres
+
+x-peerdb-worker-env: &peerdb-worker-env
+  TEMPORAL_HOST_PORT: temporal:7233
+  PEERDB_TEMPORAL_NAMESPACE: default
+
+# Credentials PeerDB hands to ClickHouse so it can read the staged Avro
+# files straight out of MinIO via the s3 table function.
+x-peerdb-minio-env: &peerdb-minio-env
+  PEERDB_CLICKHOUSE_AWS_CREDENTIALS_AWS_ACCESS_KEY_ID: _peerdb_minioadmin
+  PEERDB_CLICKHOUSE_AWS_CREDENTIALS_AWS_SECRET_ACCESS_KEY: _peerdb_minioadmin
+  PEERDB_CLICKHOUSE_AWS_CREDENTIALS_AWS_REGION: us-east-1
+  PEERDB_CLICKHOUSE_AWS_CREDENTIALS_AWS_ENDPOINT_URL_S3: http://minio:9000
+  PEERDB_CLICKHOUSE_AWS_S3_BUCKET_NAME: peerdbbucket
+
 services:
   postgres:
     image: postgres:16
@@ -24,6 +45,34 @@ services:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # Analytical warehouse. Comes up alongside postgres on `docker compose up`,
+  # with the raw-layer DDL applied automatically on first boot.
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    environment:
+      CLICKHOUSE_DB: analytics
+      CLICKHOUSE_USER: analytics
+      CLICKHOUSE_PASSWORD: secret
+      # Required for the non-default user to own objects in its own database.
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "8123:8123"  # HTTP: BI tools, curl, most drivers
+      - "9000:9000"  # native TCP: clickhouse-client, bulk inserts
+    volumes:
+      - chdata:/var/lib/clickhouse
+      # *.sql here is executed once, on first initialisation of an empty volume.
+      - ./warehouse/clickhouse/init:/docker-entrypoint-initdb.d:ro
+    # ClickHouse opens a lot of files; the Docker default of 1024 is too low.
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user analytics --password secret --query 'SELECT 1' || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -57,5 +106,156 @@ services:
     command: python -m src.streamer
     restart: unless-stopped
 
+  # ------------------------------------------------------------------
+  # PeerDB: CDC pipeline from the operational Postgres into ClickHouse.
+  # Reads the WAL via logical replication and applies changes to the
+  # warehouse continuously. Avro batches are staged through MinIO,
+  # which is how PeerDB loads ClickHouse (it uses the s3 table function).
+  # ------------------------------------------------------------------
+
+  # PeerDB's own metadata database. Separate from the operational postgres.
+  peerdb-catalog:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      PGUSER: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: peerdb
+      POSTGRES_DB: postgres
+      POSTGRES_INITDB_ARGS: --locale=C.UTF-8
+    volumes:
+      - peerdb_catalog:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-d", "postgres", "-U", "postgres"]
+      interval: 10s
+      timeout: 30s
+      retries: 10
+      start_period: 30s
+
+  # Durable workflow engine that runs the snapshot + CDC jobs.
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    restart: unless-stopped
+    depends_on:
+      peerdb-catalog:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=postgres
+      - POSTGRES_PWD=peerdb
+      - POSTGRES_SEEDS=peerdb-catalog
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+    volumes:
+      - ./warehouse/peerdb/temporal-dynamicconfig:/etc/temporal/config/dynamicconfig
+
+  # Registers the MirrorName search attribute, then idles. Also the
+  # readiness gate the flow services wait on.
+  temporal-admin-tools:
+    image: temporalio/admin-tools:1.25.2-tctl-1.18.1-cli-1.1.1
+    restart: unless-stopped
+    depends_on:
+      - temporal
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CLI_ADDRESS=temporal:7233
+    stdin_open: true
+    tty: true
+    entrypoint: /etc/temporal/entrypoint.sh
+    volumes:
+      - ./warehouse/peerdb/scripts/mirror-name-search.sh:/etc/temporal/entrypoint.sh:ro
+    healthcheck:
+      test: ["CMD", "tctl", "workflow", "list"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  flow-api:
+    image: ghcr.io/peerdb-io/flow-api:stable-v0.37.7
+    restart: unless-stopped
+    environment:
+      <<: [*peerdb-catalog-env, *peerdb-worker-env, *peerdb-minio-env]
+    depends_on:
+      temporal-admin-tools:
+        condition: service_healthy
+
+  flow-snapshot-worker:
+    image: ghcr.io/peerdb-io/flow-snapshot-worker:stable-v0.37.7
+    restart: unless-stopped
+    environment:
+      <<: [*peerdb-catalog-env, *peerdb-worker-env, *peerdb-minio-env]
+    depends_on:
+      temporal-admin-tools:
+        condition: service_healthy
+
+  flow-worker:
+    image: ghcr.io/peerdb-io/flow-worker:stable-v0.37.7
+    restart: unless-stopped
+    environment:
+      <<: [*peerdb-catalog-env, *peerdb-worker-env, *peerdb-minio-env]
+    depends_on:
+      temporal-admin-tools:
+        condition: service_healthy
+
+  # Postgres-wire server that accepts CREATE PEER / CREATE MIRROR.
+  peerdb:
+    image: ghcr.io/peerdb-io/peerdb-server:stable-v0.37.7
+    stop_signal: SIGINT
+    restart: unless-stopped
+    environment:
+      <<: *peerdb-catalog-env
+      PEERDB_PASSWORD: peerdb
+      PEERDB_FLOW_SERVER_ADDRESS: grpc://flow-api:8112
+      RUST_LOG: info
+    ports:
+      - "9900:9900"  # psql "port=9900 host=localhost password=peerdb"
+    depends_on:
+      peerdb-catalog:
+        condition: service_healthy
+
+  peerdb-ui:
+    image: ghcr.io/peerdb-io/peerdb-ui:stable-v0.37.7
+    restart: unless-stopped
+    environment:
+      <<: *peerdb-catalog-env
+      PEERDB_FLOW_SERVER_HTTP: http://flow-api:8113
+      NEXTAUTH_SECRET: __changeme__
+      NEXTAUTH_URL: http://localhost:3000
+    ports:
+      - "3000:3000"  # mirror status dashboard
+    depends_on:
+      - flow-api
+
+  # S3-compatible staging for the Avro batches PeerDB hands to ClickHouse.
+  # Both flow-worker (writer) and clickhouse (reader) reach it as http://minio:9000
+  # on the compose network, so no host-IP juggling is needed.
+  minio:
+    image: quay.io/minio/minio:latest  # Docker Hub minio/minio is not publicly pullable
+    restart: unless-stopped
+    environment:
+      <<: *peerdb-minio-env
+    volumes:
+      - minio_data:/data
+    ports:
+      - "19001:9000"  # S3 API
+      - "19002:9001"  # web console
+    entrypoint: >
+      /bin/sh -c "
+      export MINIO_ROOT_USER=$$PEERDB_CLICKHOUSE_AWS_CREDENTIALS_AWS_ACCESS_KEY_ID;
+      export MINIO_ROOT_PASSWORD=$$PEERDB_CLICKHOUSE_AWS_CREDENTIALS_AWS_SECRET_ACCESS_KEY;
+      minio server /data --console-address=':9001' &
+      sleep 3;
+      /usr/bin/mc alias set peerdbminio http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD;
+      /usr/bin/mc mb --ignore-existing peerdbminio/$$PEERDB_CLICKHOUSE_AWS_S3_BUCKET_NAME;
+      wait "
+    healthcheck:
+      test: ["CMD", "mc", "ready", "peerdbminio"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
 volumes:
   pgdata:
+  chdata:
+  peerdb_catalog:
+  minio_data:

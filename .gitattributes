@@ -1,0 +1,9 @@
+# This repo is developed on Windows but every script here is executed inside a
+# Linux container. With core.autocrlf=true a clone would rewrite these to CRLF,
+# which breaks `#!/bin/sh` ("no such file or directory") and make recipes.
+# Pin them to LF so a Windows checkout still produces working containers.
+*.sh      text eol=lf
+*.sql     text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+Makefile  text eol=lf
