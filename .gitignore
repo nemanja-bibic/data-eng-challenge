@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .venv/
 .DS_Store
+warehouse/dbt/target/
+warehouse/dbt/dbt_packages/
+warehouse/dbt/logs/
+warehouse/dbt/.user.yml

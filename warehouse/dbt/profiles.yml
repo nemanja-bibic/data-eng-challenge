@@ -1,0 +1,17 @@
+# Connection is driven by env vars set in docker-compose.yml, so the same
+# profile works inside the container (host=clickhouse) and from the host
+# (CLICKHOUSE_HOST=localhost).
+langdock_analytics:
+  target: dev
+  outputs:
+    dev:
+      type: clickhouse
+      driver: http
+      host: "{{ env_var('CLICKHOUSE_HOST', 'clickhouse') }}"
+      port: "{{ env_var('CLICKHOUSE_PORT', '8123') | int }}"
+      user: "{{ env_var('CLICKHOUSE_USER', 'analytics') }}"
+      password: "{{ env_var('CLICKHOUSE_PASSWORD', 'secret') }}"
+      # In dbt-clickhouse, schema maps to a ClickHouse database.
+      schema: "{{ env_var('CLICKHOUSE_DB', 'analytics') }}"
+      secure: false
+      threads: 4

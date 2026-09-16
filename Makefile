@@ -1,4 +1,4 @@
-.PHONY: up down reseed logs ps psql clickhouse ch-schema mirror peerdb mirror-lag
+.PHONY: up down reseed logs ps psql clickhouse ch-schema mirror peerdb mirror-lag dbt dbt-debug dbt-build dbt-freshness
 
 # Start everything (build images, run in background).
 up:
@@ -46,3 +46,19 @@ mirror-lag:
 	  "SELECT 'postgres.messages', count(*) FROM messages;"
 	@docker compose exec -T clickhouse clickhouse-client --user analytics --password secret --query \
 	  "SELECT 'clickhouse.raw_messages', count() FROM analytics.raw_messages"
+
+# Shell inside the dbt container (project mounted at /usr/app).
+dbt:
+	docker compose exec dbt bash
+
+# Check dbt can reach ClickHouse.
+dbt-debug:
+	docker compose exec dbt dbt debug
+
+# Run and test all models.
+dbt-build:
+	docker compose exec dbt dbt build
+
+# Fail if the mirror has stopped delivering messages/usage.
+dbt-freshness:
+	docker compose exec dbt dbt source freshness

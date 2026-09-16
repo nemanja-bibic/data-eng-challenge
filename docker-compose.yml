@@ -77,6 +77,24 @@ services:
       timeout: 5s
       retries: 12
 
+  # dbt for the modelled layers on top of the raw mirror. Idles so commands
+  # run via `docker compose exec dbt dbt <cmd>` (see `make dbt-*`). The project
+  # is bind-mounted, so model edits on the host need no rebuild.
+  dbt:
+    build: ./warehouse/dbt
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_USER: analytics
+      CLICKHOUSE_PASSWORD: secret
+      CLICKHOUSE_DB: analytics
+    volumes:
+      - ./warehouse/dbt:/usr/app
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+
   seed:
     build: .
     environment:

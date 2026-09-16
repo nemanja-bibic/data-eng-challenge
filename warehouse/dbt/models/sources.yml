@@ -1,0 +1,26 @@
+version: 2
+
+# Raw landing tables written by the PeerDB mirror (warehouse/peerdb/mirror.sql).
+# Each is a ReplacingMergeTree versioned by _peerdb_version; read with FINAL
+# (or dedupe on id) and filter _peerdb_is_deleted = 0 to get current state.
+sources:
+  - name: raw
+    schema: analytics
+    tables:
+      - name: raw_users
+      - name: raw_models
+      - name: raw_assistants
+      - name: raw_conversations
+      # Only messages and usage grow continuously (via the streamer), so they
+      # are the tables where a stale sync timestamp means a stalled mirror.
+      - name: raw_messages
+        loaded_at_field: _peerdb_synced_at
+        freshness:
+          warn_after: { count: 5, period: minute }
+          error_after: { count: 30, period: minute }
+      - name: raw_usage
+        loaded_at_field: _peerdb_synced_at
+        freshness:
+          warn_after: { count: 5, period: minute }
+          error_after: { count: 30, period: minute }
+      - name: raw_feedback
